@@ -364,10 +364,11 @@ class Position:
                     self.drawdown_summ += drawdown
                     self.runup_summ += runup
 
-                    assert order.exit_id is not None
+                    # exit_id can be None for synthetic close orders (position reversals)
+                    exit_id = order.exit_id if order.exit_id is not None else "Position Reversal"
 
                     closed_trade.size = -size
-                    closed_trade.exit_id = order.exit_id
+                    closed_trade.exit_id = exit_id
                     closed_trade.exit_bar_index = int(lib.bar_index)
                     closed_trade.exit_time = lib._time
                     closed_trade.exit_price = price
@@ -412,12 +413,20 @@ class Position:
                     # Modify sizes
                     self.size += size
                     # Handle too small sizes because of floating point inaccuracy and rounding
-                    if math.isclose(self.size, 0.0, abs_tol=1 / syminfo._size_round_factor):
+                    # Use a slightly larger tolerance to catch positions just above volume_step
+                    min_volume = 1.0 / syminfo._size_round_factor  # e.g., 0.01
+                    tolerance = min_volume * 1.5  # e.g., 0.015 to catch 0.0100000001
+                    
+                    if abs(self.size) < tolerance:
                         size -= self.size
                         self.size = 0.0
                     self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
                     trade.size += size
                     order.size -= size
+                    
+                    # Clean up trade size if it's tiny (floating point residual after partial close)
+                    if abs(trade.size) < tolerance:
+                        trade.size = 0.0
 
                     # Gross P/L and counters
                     if closed_trade.profit == 0.0:
@@ -473,6 +482,17 @@ class Position:
 
         # New trade
         elif order.order_type != _order_type_close:
+            # Skip if order size is too small (sub-minimum volume)
+            min_volume = 1.0 / syminfo._size_round_factor
+            tolerance = min_volume * 1.5
+            if abs(order.size) < tolerance:
+                # Remove the order as it's too small to trade
+                for key, stored_order in list(self.orders.items()):
+                    if stored_order is order:
+                        del self.orders[key]
+                        break
+                return
+            
             # Calculate commission
             if commission_value:
                 if commission_type == _commission.cash_per_order:
@@ -593,6 +613,8 @@ class Position:
             self.fill_order(order, p, p, self.l)
 
     def _check_high(self, order: Order):
+        cur_time_human = datetime.fromtimestamp(lib._time / 1000).strftime('%Y-%m-%d %H:%M:%S')
+
         """ Check high limit """
         if order.limit is not None:
             if ((order.order_type == _order_type_close and order.size < 0) or (
@@ -608,7 +630,9 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
+                old_stop = order.stop
                 order.stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
+
 
     def _check_low_stop(self, order: Order):
         """ Check low stop """
@@ -639,16 +663,46 @@ class Position:
 
     def _check_close(self, order: Order, ohlcv: bool):
         """ Check close price if trailing stop is triggered """
-        # open → high → low → close
-        if ohlcv and order.stop <= self.c:
-            self.fill_order(order, order.stop, order.stop, self.l)
-
-        # open → low → high → close
-        elif order.stop >= self.c:
-            self.fill_order(order, order.stop, self.h, order.stop)
+        if order.stop is None:
+            return
+        
+        # For LONG exits (sign < 0): stop is below, triggers when price drops
+        if order.sign < 0 and self.c <= order.stop:
+            # open → high → low → close
+            if ohlcv:
+                self.fill_order(order, order.stop, order.stop, self.l)
+            # open → low → high → close
+            else:
+                self.fill_order(order, order.stop, self.h, order.stop)
+        
+        # For SHORT exits (sign > 0): stop is above, triggers when price rises
+        elif order.sign > 0 and self.c >= order.stop:
+            # open → high → low → close
+            if ohlcv:
+                self.fill_order(order, order.stop, order.stop, self.l)
+            # open → low → high → close
+            else:
+                self.fill_order(order, order.stop, self.h, order.stop)
 
     def process_orders(self):
         """ Process orders """
+        # Clean up any sub-minimum trades from previous bars (floating point accumulation)
+        min_volume = 1.0 / syminfo._size_round_factor
+        tolerance = min_volume * 1.5
+        
+        cleaned_trades = []
+        for trade in self.open_trades:
+            if abs(trade.size) < tolerance:
+                # Close this tiny trade immediately at current price
+                self.size -= trade.size
+                if abs(self.size) < tolerance:
+                    self.size = 0.0
+                self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
+                # Don't add it to cleaned_trades (effectively removes it)
+            else:
+                cleaned_trades.append(trade)
+        self.open_trades = cleaned_trades
+        
         # We need to round to the nearest tick to get the same results as in TradingView
         round_to_mintick = lib.math.round_to_mintick
         self.o = round_to_mintick(lib.open)
@@ -707,11 +761,11 @@ class Position:
             # Calculate open drawdowns and runups
             for trade in self.open_trades:
                 # Profit of trade
-                trade.profit = trade.size * (self.c - trade.entry_price) - 2 * trade.commission
+                trade.profit = trade.size * (self.c - trade.entry_price) - trade.commission
 
                 # P/L from high/low to calculate drawdown and runup
-                hprofit = trade.size * (self.h - self.avg_price) - trade.commission
-                lprofit = trade.size * (self.l - self.avg_price) - trade.commission
+                hprofit = trade.size * (self.h - trade.entry_price) - trade.commission
+                lprofit = trade.size * (self.l - trade.entry_price) - trade.commission
                 # Drawdown
                 drawdown = -min(hprofit, lprofit, 0.0)
                 trade.max_drawdown = max(drawdown, trade.max_drawdown)
@@ -1128,6 +1182,13 @@ def exit(id: str, from_entry: str = "",
 
     def _exit():
         nonlocal limit, stop, trail_price, from_entry, direction, size
+
+        # Skip if original trade/order size is essentially zero (floating point residual)
+        # Use a slightly larger tolerance to catch positions just above volume_step
+        min_volume = 1.0 / syminfo._size_round_factor
+        tolerance = min_volume * 1.5
+        if abs(size) < tolerance:
+            return
 
         if isinstance(qty, NA):
             size = -size * (qty_percent * 0.01) if not isinstance(qty_percent, NA) else -size

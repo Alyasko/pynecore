@@ -41,7 +41,8 @@ class SymInfo:
     avg_spread: float | None = None
     taker_fee: float | None = None
     maker_fee: float | None = None
-    
+    volume_step: float | None = None  # Minimum volume increment (e.g., 0.01 for fractional lots)
+
     # Analyst price target information (added 2025-07-08)
     target_price_average: float | None = None
     target_price_high: float | None = None
@@ -119,6 +120,7 @@ class SymInfo:
             avg_spread=symbol.get('avg_spread'),
             taker_fee=symbol.get('taker_fee'),
             maker_fee=symbol.get('maker_fee'),
+            volume_step=symbol.get('volume_step'),
             target_price_average=symbol.get('target_price_average'),
             target_price_high=symbol.get('target_price_high'),
             target_price_low=symbol.get('target_price_low'),
@@ -156,7 +158,7 @@ class SymInfo:
         # Basic fields
         for key in ['prefix', 'description', 'ticker', 'currency', 'basecurrency',
                     'period', 'type', 'mintick', 'pricescale', 'minmove', 'pointvalue',
-                    'timezone', 'volumetype', 'avg_spread', 'taker_fee', 'maker_fee',
+                    'timezone', 'volumetype', 'avg_spread', 'taker_fee', 'maker_fee', 'volume_step',
                     'target_price_average', 'target_price_high', 'target_price_low', 'target_price_date']:
             lines.append(format_field(key, getattr(self, key)))
 

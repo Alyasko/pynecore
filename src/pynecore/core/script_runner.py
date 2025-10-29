@@ -72,7 +72,7 @@ def _round_price(price: float, lib: ModuleType):
         from .. import lib
     syminfo = lib.syminfo
     scaled = round(price * syminfo.pricescale)
-    return scaled * syminfo.mintick
+    return scaled / syminfo.pricescale
 
 
 # noinspection PyShadowingNames
@@ -122,10 +122,16 @@ def _set_lib_syminfo_properties(syminfo: SymInfo, lib: ModuleType):
     lib.syminfo._session_starts = syminfo.session_starts
     lib.syminfo._session_ends = syminfo.session_ends
 
+    # Calculate size rounding factor based on volume_step or asset type
     if syminfo.type == 'crypto':
-        decimals = 6 if syminfo.basecurrency == 'BTC' else 4  # TODO: is it correct?
+        decimals = 6 if syminfo.basecurrency == 'BTC' else 4
         lib.syminfo._size_round_factor = 10 ** decimals
+    elif syminfo.volume_step is not None and syminfo.volume_step < 1.0:
+        # For assets with fractional volume support (e.g., Forex/CFDs with 0.01 lots)
+        # Calculate rounding factor: 0.01 -> 100, 0.1 -> 10, etc.
+        lib.syminfo._size_round_factor = int(1.0 / syminfo.volume_step)
     else:
+        # Default: integer-only volumes
         lib.syminfo._size_round_factor = 1
 
 
