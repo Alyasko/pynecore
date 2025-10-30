@@ -85,6 +85,7 @@ class Order:
         "comment", "alert_message",
         "trail_price", "trail_offset",
         "trail_triggered",
+        "_size_units",  # Internal: size in integer volume-step units
     )
 
     def __init__(
@@ -104,8 +105,10 @@ class Order:
             trail_offset: float | None = None
     ):
         self.order_id = order_id
-        self.size = size
-        self.sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
+        # Store size in integer units for exact arithmetic
+        self._size_units = _qty_to_units(size)
+        self.size = _units_to_qty(self._size_units)
+        self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
         self.limit = limit
         self.stop = stop
         self.order_type = order_type
@@ -140,13 +143,16 @@ class Trade:
         "commission", "max_drawdown", "max_drawdown_percent", "max_runup", "max_runup_percent",
         "profit", "profit_percent", "cum_profit", "cum_profit_percent",
         "cum_max_drawdown", "cum_max_runup",
+        "_size_units",  # Internal: size in integer volume-step units
     )
 
     # noinspection PyShadowingNames
     def __init__(self, *, size: float, entry_id: str, entry_bar_index: int, entry_time: int, entry_price: float,
                  commission: float, entry_comment: str, entry_equity: float):
-        self.size: float = size
-        self.sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
+        # Store size in integer units for exact arithmetic
+        self._size_units = _qty_to_units(size)
+        self.size: float = _units_to_qty(self._size_units)
+        self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
 
         self.entry_id: str = entry_id
         self.entry_bar_index: int = entry_bar_index
@@ -224,6 +230,7 @@ class Position:
     size: float = 0.0
     sign: float = 0.0
     avg_price: float = 0.0
+    _size_units: int = 0  # Internal: position size in integer volume-step units
 
     cum_profit: float | NA[float] = 0.0
 
@@ -294,6 +301,7 @@ class Position:
         self.entry_summ = 0.0
         self.open_commission = 0.0
         self.size = 0.0
+        self._size_units = 0
         self.sign = 0.0
         self.avg_price = 0.0
         self.netprofit = 0.0
@@ -333,17 +341,24 @@ class Position:
             open_trades = []
             for trade in self.open_trades:
                 # Only use if its order id is the same
-                if order.size != 0.0 and (trade.entry_id == order.order_id or order.order_id is None):
+                if order._size_units != 0 and (trade.entry_id == order.order_id or order.order_id is None):
                     delete = True
 
-                    size = order.size if abs(order.size) <= abs(trade.size) else -trade.size
+                    # Work in integer units for exact arithmetic
+                    size_units = (order._size_units if abs(order._size_units) <= abs(trade._size_units) 
+                                  else -trade._size_units)
+                    if size_units == 0:
+                        continue
+                    
+                    # Convert to float only for price calculations
+                    size = _units_to_qty(size_units)
                     pnl = -size * (price - trade.entry_price)
 
                     # Copy and modify actual trade, because it can be partially filled
                     closed_trade = copy(trade)
 
                     size_ratio = 1 + size / closed_trade.size
-                    if closed_trade.size != -size:
+                    if closed_trade._size_units != -size_units:
                         # Modify commission
                         trade.commission *= size_ratio
                         closed_trade.commission *= (1 - size_ratio)
@@ -410,23 +425,17 @@ class Position:
                     # Realize profit or loss
                     self.netprofit += pnl
 
-                    # Modify sizes
-                    self.size += size
-                    # Handle too small sizes because of floating point inaccuracy and rounding
-                    # Use a slightly larger tolerance to catch positions just above volume_step
-                    min_volume = 1.0 / syminfo._size_round_factor  # e.g., 0.01
-                    tolerance = min_volume * 1.5  # e.g., 0.015 to catch 0.0100000001
+                    # Modify sizes using integer units (no rounding errors!)
+                    self._size_units += size_units
+                    self.size = _units_to_qty(self._size_units)
+                    self.sign = 0.0 if self._size_units == 0 else 1.0 if self._size_units > 0 else -1.0
                     
-                    if abs(self.size) < tolerance:
-                        size -= self.size
-                        self.size = 0.0
-                    self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
-                    trade.size += size
-                    order.size -= size
+                    trade._size_units += size_units
+                    trade.size = _units_to_qty(trade._size_units)
                     
-                    # Clean up trade size if it's tiny (floating point residual after partial close)
-                    if abs(trade.size) < tolerance:
-                        trade.size = 0.0
+                    order._size_units -= size_units
+                    order.size = _units_to_qty(order._size_units)
+                    order.sign = 0.0 if order._size_units == 0 else 1.0 if order._size_units > 0 else -1.0
 
                     # Gross P/L and counters
                     if closed_trade.profit == 0.0:
@@ -454,7 +463,7 @@ class Position:
                     closed_trade.exit_equity = self.equity
 
                     # Remove from open trades if it is fully filled
-                    if trade.size == 0.0:
+                    if trade._size_units == 0:
                         continue
 
                     if pnl > 0.0:
@@ -482,10 +491,8 @@ class Position:
 
         # New trade
         elif order.order_type != _order_type_close:
-            # Skip if order size is too small (sub-minimum volume)
-            min_volume = 1.0 / syminfo._size_round_factor
-            tolerance = min_volume * 1.5
-            if abs(order.size) < tolerance:
+            # Skip if order size is zero
+            if order._size_units == 0:
                 # Remove the order as it's too small to trade
                 for key, stored_order in list(self.orders.items()):
                     if stored_order is order:
@@ -529,8 +536,10 @@ class Position:
                 entry_equity=before_equity
             )
             self.open_trades.append(trade)
-            self.size += trade.size
-            self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
+            # Use integer units for exact arithmetic
+            self._size_units += trade._size_units
+            self.size = _units_to_qty(self._size_units)
+            self.sign = 0.0 if self._size_units == 0 else 1.0 if self._size_units > 0 else -1.0
 
             # Average entry price
             self.entry_summ += price * abs(order.size)
@@ -571,16 +580,15 @@ class Position:
         """
         # If position direction is about to change, we split it into two separate orders
         # This is necessary to create a new average entry price
-        new_size = self.size + order.size
-        if new_size != 0.0 and not math.isclose(new_size, 0.0,
-                                                abs_tol=1 / syminfo._size_round_factor):  # Check for rounding errors
-            new_size = 0.0
-        new_sign = 0.0 if new_size == 0.0 else 1.0 if new_size > 0.0 else -1.0
-        if self.size != 0.0 and new_sign != self.sign and new_size != 0.0:
+        new_size_units = self._size_units + order._size_units
+        new_sign = 0.0 if new_size_units == 0 else 1.0 if new_size_units > 0 else -1.0
+        if self._size_units != 0 and new_sign != self.sign and new_size_units != 0:
             # Create a copy for closing existing position
             order1 = copy(order)
             order1.order_type = _order_type_close
-            order1.size = -self.size
+            order1._size_units = -self._size_units
+            order1.size = _units_to_qty(order1._size_units)
+            order1.sign = 0.0 if order1._size_units == 0 else 1.0 if order1._size_units > 0 else -1.0
             # Set order_id to None so it will close any open trades
             order1.order_id = None
             # Don't need to remove this order, because it is not in the orders list
@@ -588,7 +596,9 @@ class Position:
             # Fill the closing order first
             self._fill_order(order1, price, h, l)
             # Modify the original order to open a position in the new direction
-            order.size = new_size
+            order._size_units = new_size_units
+            order.size = _units_to_qty(order._size_units)
+            order.sign = 0.0 if order._size_units == 0 else 1.0 if order._size_units > 0 else -1.0
             assert order.order_id is not None
             # Store with appropriate prefix based on order type
             if order.order_type == _order_type_entry:
@@ -686,18 +696,14 @@ class Position:
 
     def process_orders(self):
         """ Process orders """
-        # Clean up any sub-minimum trades from previous bars (floating point accumulation)
-        min_volume = 1.0 / syminfo._size_round_factor
-        tolerance = min_volume * 1.5
-        
+        # Clean up any zero-sized trades (should not normally happen with integer units)
         cleaned_trades = []
         for trade in self.open_trades:
-            if abs(trade.size) < tolerance:
-                # Close this tiny trade immediately at current price
-                self.size -= trade.size
-                if abs(self.size) < tolerance:
-                    self.size = 0.0
-                self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
+            if trade._size_units == 0:
+                # Remove this zero-sized trade
+                self._size_units -= trade._size_units  # This is 0, but for consistency
+                self.size = _units_to_qty(self._size_units)
+                self.sign = 0.0 if self._size_units == 0 else 1.0 if self._size_units > 0 else -1.0
                 # Don't add it to cleaned_trades (effectively removes it)
             else:
                 cleaned_trades.append(trade)
@@ -826,17 +832,45 @@ class Position:
 #
 
 # noinspection PyProtectedMember
+def _qty_to_units(qty: float) -> int:
+    """
+    Convert quantity to integer volume-step units.
+    Uses banker's rounding (round half to even) for consistency.
+    
+    :param qty: The quantity to convert
+    :return: Integer units
+    """
+    if qty == 0.0:
+        return 0
+    rfactor = syminfo._size_round_factor  # noqa
+    # Round to nearest integer unit (banker's rounding for .5 cases)
+    abs_units = round(abs(qty) * rfactor)
+    return abs_units if qty > 0 else -abs_units
+
+
+# noinspection PyProtectedMember
+def _units_to_qty(units: int) -> float:
+    """
+    Convert integer volume-step units back to float quantity.
+    
+    :param units: Integer units
+    :return: Float quantity
+    """
+    if units == 0:
+        return 0.0
+    return units / syminfo._size_round_factor  # noqa
+
+
+# noinspection PyProtectedMember
 def _size_round(qty: float) -> float:
     """
-    Round size to the nearest possible value
+    Round size to the nearest possible value.
+    This is a convenience wrapper around _qty_to_units + _units_to_qty.
 
     :param qty: The quantity to round
     :return: The rounded quantity
     """
-    rfactor = syminfo._size_round_factor  # noqa
-    qrf = int(abs(qty) * rfactor * 10.0) * 0.1  # We need to floor to one decimal place
-    sign = 1 if qty > 0 else -1
-    return sign * int(qrf) / rfactor
+    return _units_to_qty(_qty_to_units(qty))
 
 
 # noinspection PyShadowingNames
@@ -1183,11 +1217,8 @@ def exit(id: str, from_entry: str = "",
     def _exit():
         nonlocal limit, stop, trail_price, from_entry, direction, size
 
-        # Skip if original trade/order size is essentially zero (floating point residual)
-        # Use a slightly larger tolerance to catch positions just above volume_step
-        min_volume = 1.0 / syminfo._size_round_factor
-        tolerance = min_volume * 1.5
-        if abs(size) < tolerance:
+        # Skip if original trade/order size is zero (after rounding to volume_step)
+        if size == 0.0:
             return
 
         if isinstance(qty, NA):

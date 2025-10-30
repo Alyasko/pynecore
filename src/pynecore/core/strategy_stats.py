@@ -215,8 +215,6 @@ def calculate_strategy_statistics(
         stats.net_profit_percent = (stats.net_profit / initial_capital) * 100
         stats.gross_profit_percent = (stats.gross_profit / initial_capital) * 100
         stats.gross_loss_percent = (stats.gross_loss / initial_capital) * 100
-        stats.max_equity_drawdown_percent = (stats.max_equity_drawdown / initial_capital) * 100
-        stats.max_equity_runup_percent = (stats.max_equity_runup / initial_capital) * 100
 
     # Buy & Hold calculation
     if first_price and last_price and first_price > 0:
@@ -241,6 +239,51 @@ def calculate_strategy_statistics(
     # Profit factor
     if stats.gross_loss != 0:
         stats.profit_factor = abs(stats.gross_profit / stats.gross_loss)
+
+    # Calculate drawdown and runup from closed trades (matching calculate_metrics.py)
+    # This only considers drawdowns at trade exit points, not intra-trade drawdowns
+    if closed_trades:
+        # Build equity values at each trade exit
+        equity_at_exits = []
+        cumulative_profit = 0.0
+        
+        for trade in closed_trades:
+            cumulative_profit += float(trade.profit)
+            equity_at_exit = initial_capital + cumulative_profit
+            equity_at_exits.append(equity_at_exit)
+        
+        # Calculate max drawdown from peak equity (at exit points only)
+        if equity_at_exits:
+            peak_equity = initial_capital
+            max_dd = 0.0
+            max_dd_pct = 0.0
+            
+            for equity in equity_at_exits:
+                peak_equity = max(peak_equity, equity)
+                if peak_equity > 0:
+                    drawdown = peak_equity - equity
+                    drawdown_pct = (drawdown / peak_equity) * 100
+                    max_dd = max(max_dd, drawdown)
+                    max_dd_pct = max(max_dd_pct, drawdown_pct)
+            
+            stats.max_equity_drawdown = max_dd
+            stats.max_equity_drawdown_percent = max_dd_pct
+            
+            # Calculate max runup from valley equity (at exit points only)
+            valley_equity = initial_capital
+            max_ru = 0.0
+            max_ru_pct = 0.0
+            
+            for equity in equity_at_exits:
+                valley_equity = min(valley_equity, equity)
+                if valley_equity > 0:
+                    runup = equity - valley_equity
+                    runup_pct = (runup / valley_equity) * 100
+                    max_ru = max(max_ru, runup)
+                    max_ru_pct = max(max_ru_pct, runup_pct)
+            
+            stats.max_equity_runup = max_ru
+            stats.max_equity_runup_percent = max_ru_pct
 
     # Calculate trade statistics
     if closed_trades:
